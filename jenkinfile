@@ -1,0 +1,171 @@
+// =====================================================
+//  Jenkinsfile — React + Node.js Full Stack Pipeline
+//  Stages: Checkout → Build Backend → Build Frontend
+//          → Docker Build → Deploy → Health Check
+// =====================================================
+
+pipeline {
+
+    agent any
+
+    environment {
+        BACKEND_IMAGE  = "yourname/todo-backend"
+        FRONTEND_IMAGE = "yourname/todo-frontend"
+        IMAGE_TAG      = "${env.BUILD_NUMBER}"
+        DOCKER_CREDS   = 'dockerhub-creds'       // Jenkins credential ID
+        API_URL        = 'http://your-server-ip:5000'
+    }
+
+    options {
+        timeout(time: 30, unit: 'MINUTES')
+        buildDiscarder(logRotator(numToKeepStr: '5'))
+        disableConcurrentBuilds()
+    }
+
+    triggers {
+        githubPush()
+    }
+
+    stages {
+
+        // ── 1. CHECKOUT ──────────────────────────────────
+        stage('Checkout') {
+            steps {
+                echo '>>> Pulling code from GitHub...'
+                checkout scm
+                sh 'git log -1 --oneline'
+            }
+        }
+
+        // ── 2. INSTALL BACKEND DEPENDENCIES ─────────────
+        stage('Install Backend') {
+            steps {
+                dir('backend') {
+                    echo '>>> Installing backend dependencies...'
+                    sh 'npm install'
+                }
+            }
+        }
+
+        // ── 3. INSTALL & BUILD REACT FRONTEND ───────────
+        stage('Build Frontend') {
+            steps {
+                dir('frontend') {
+                    echo '>>> Installing frontend dependencies...'
+                    sh 'npm install'
+                    echo '>>> Building React production bundle...'
+                    sh """
+                        REACT_APP_API_URL=${API_URL} \
+                        REACT_APP_BUILD_NUMBER=${IMAGE_TAG} \
+                        npm run build
+                    """
+                }
+            }
+            post {
+                success {
+                    echo 'React build completed successfully!'
+                    // Archive the build folder as an artifact
+                    archiveArtifacts artifacts: 'frontend/build/**', fingerprint: true
+                }
+            }
+        }
+
+        // ── 4. BUILD DOCKER IMAGES ───────────────────────
+        stage('Docker Build') {
+            parallel {
+                stage('Backend Image') {
+                    steps {
+                        echo ">>> Building backend Docker image..."
+                        sh """
+                            docker build \
+                                -t ${BACKEND_IMAGE}:${IMAGE_TAG} \
+                                -t ${BACKEND_IMAGE}:latest \
+                                ./backend
+                        """
+                    }
+                }
+                stage('Frontend Image') {
+                    steps {
+                        echo ">>> Building frontend Docker image..."
+                        sh """
+                            docker build \
+                                --build-arg REACT_APP_API_URL=${API_URL} \
+                                --build-arg REACT_APP_BUILD_NUMBER=${IMAGE_TAG} \
+                                -t ${FRONTEND_IMAGE}:${IMAGE_TAG} \
+                                -t ${FRONTEND_IMAGE}:latest \
+                                ./frontend
+                        """
+                    }
+                }
+            }
+        }
+
+        // ── 5. PUSH TO DOCKER HUB ───────────────────────
+        stage('Push Images') {
+            steps {
+                echo '>>> Pushing images to Docker Hub...'
+                withCredentials([usernamePassword(
+                    credentialsId: "${DOCKER_CREDS}",
+                    usernameVariable: 'DOCKER_USER',
+                    passwordVariable: 'DOCKER_PASS'
+                )]) {
+                    sh """
+                        echo "$DOCKER_PASS" | docker login -u "$DOCKER_USER" --password-stdin
+                        docker push ${BACKEND_IMAGE}:${IMAGE_TAG}
+                        docker push ${BACKEND_IMAGE}:latest
+                        docker push ${FRONTEND_IMAGE}:${IMAGE_TAG}
+                        docker push ${FRONTEND_IMAGE}:latest
+                        docker logout
+                    """
+                }
+            }
+        }
+
+        // ── 6. DEPLOY ────────────────────────────────────
+        stage('Deploy') {
+            steps {
+                echo '>>> Deploying with docker-compose...'
+                sh """
+                    export BUILD_NUMBER=${IMAGE_TAG}
+                    docker compose down --remove-orphans || true
+                    docker compose pull
+                    docker compose up -d
+                """
+            }
+        }
+
+        // ── 7. HEALTH CHECK ──────────────────────────────
+        stage('Health Check') {
+            steps {
+                echo '>>> Waiting for services to start...'
+                sh 'sleep 10'
+                sh 'curl -f http://localhost:5000/health || exit 1'
+                sh 'curl -f http://localhost:3000        || exit 1'
+                echo 'Both backend and frontend are healthy!'
+            }
+        }
+
+    }
+
+    // ════════════════════════════════════════════════════
+    //  POST
+    // ════════════════════════════════════════════════════
+    post {
+        success {
+            echo """
+            ╔═══════════════════════════════════╗
+            ║  BUILD #${env.BUILD_NUMBER} SUCCESS  ║
+            ║  Frontend → http://localhost:3000  ║
+            ║  Backend  → http://localhost:5000  ║
+            ╚═══════════════════════════════════╝
+            """
+        }
+        failure {
+            echo 'Pipeline failed! Check the logs above.'
+        }
+        always {
+            sh 'docker image prune -f || true'
+            cleanWs()
+        }
+    }
+}
